@@ -1,0 +1,10 @@
+.env
+.DS_Store
+out/
+cache/
+broadcast/
+runs/
+*.log
+__pycache__/
+*.py[cod]
+tasks/*/environment/project/reference/etherscan/

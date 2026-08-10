@@ -1,0 +1,26 @@
+[dataset]
+name = "rl-exploits/smoke"
+description = "Whitehat RL environments for reproducing publicly known on-chain opportunities"
+authors = []
+keywords = ["ethereum", "foundry", "defi", "security", "rl"]
+
+[[tasks]]
+name = "rl-exploits/notional-v1"
+
+[[tasks]]
+name = "rl-exploits/trusted-volumes"
+
+[[tasks]]
+name = "rl-exploits/projekt-reward-vault"
+
+[[tasks]]
+name = "rl-exploits/rwa-vault"
+
+[[tasks]]
+name = "rl-exploits/prxvt"
+
+[[tasks]]
+name = "rl-exploits/aztec-v2"
+
+[[tasks]]
+name = "rl-exploits/bunni-v2"
