@@ -36,8 +36,8 @@ class ToolEnvironmentTests(unittest.TestCase):
                 "BASE_RPC_URL": "secret",
                 "ARCHIVE_RPC_URL": "secret",
                 "RL_TASK_POLICY_ARCHIVE_RPC": "secret",
-                "FORK_REPLAY_TRANSACTION_HASHES": "historical-hash",
-                "FORK_STORAGE_PATCHES": "hidden-setup",
+                "FORK_BLOCK_NUMBER": "25541000",
+                "FORK_TARGET_TIMESTAMP": "1777388411",
                 "KEEP_ARCHIVE_RPC": "1",
                 "RPC_URL": "http://pier-policy:8545",
             }
@@ -46,8 +46,8 @@ class ToolEnvironmentTests(unittest.TestCase):
         self.assertEqual(result["HOME"], "/home/rltool")
         self.assertEqual(result["USER"], "rltool")
         self.assertNotIn("ARCHIVE_RPC_URL", result)
-        self.assertNotIn("FORK_REPLAY_TRANSACTION_HASHES", result)
-        self.assertNotIn("FORK_STORAGE_PATCHES", result)
+        self.assertNotIn("FORK_BLOCK_NUMBER", result)
+        self.assertNotIn("FORK_TARGET_TIMESTAMP", result)
         self.assertNotIn("KEEP_ARCHIVE_RPC", result)
 
     def test_tool_command_drops_root_and_all_capabilities(self):

@@ -63,6 +63,7 @@ class ComposePolicyTests(unittest.TestCase):
                     "cap_drop": [],
                     "cap_add": ["ALL"],
                     "security_opt": [],
+                    "networks": ["default", BACKEND_NETWORK],
                 }
             }
         }
@@ -81,6 +82,7 @@ class ComposePolicyTests(unittest.TestCase):
             ["CHOWN", "DAC_OVERRIDE", "KILL", "SETGID", "SETPCAP", "SETUID"],
         )
         self.assertEqual(main["security_opt"], ["no-new-privileges:true"])
+        self.assertEqual(main["networks"], [AGENT_NETWORK])
 
     def test_secrets_are_only_in_sidecars(self):
         compose = add_policy_services(
@@ -109,6 +111,8 @@ class ComposePolicyTests(unittest.TestCase):
             archive_rpc="base-archive",
             etherscan_api_key="source-key",
             fork_block="40229652",
+            expected_block="40229653",
+            target_timestamp="1767225600",
             chain_id="8453",
             hardfork="cancun",
         )
@@ -118,6 +122,18 @@ class ComposePolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             services[ANVIL_SERVICE]["environment"]["ANVIL_HARDFORK"], "cancun"
+        )
+        self.assertEqual(
+            services[ANVIL_SERVICE]["environment"]["FORK_BLOCK_NUMBER"],
+            "40229652",
+        )
+        self.assertEqual(
+            services[ANVIL_SERVICE]["environment"]["FORK_EXPECTED_BLOCK_NUMBER"],
+            "40229653",
+        )
+        self.assertEqual(
+            services[ANVIL_SERVICE]["environment"]["FORK_TARGET_TIMESTAMP"],
+            "1767225600",
         )
         self.assertEqual(
             services[POLICY_SERVICE]["environment"]["EXPLORER_CHAIN_ID"], "8453"

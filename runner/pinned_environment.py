@@ -23,6 +23,8 @@ def add_policy_services(
     archive_rpc: str,
     etherscan_api_key: str,
     fork_block: str,
+    expected_block: str | None = None,
+    target_timestamp: str | None = None,
     chain_id: str = "1",
     hardfork: str = "osaka",
 ) -> dict[str, Any]:
@@ -47,12 +49,26 @@ def add_policy_services(
         "SETUID",
     ]
     main["security_opt"] = ["no-new-privileges:true"]
-    main_networks = main.setdefault("networks", [])
-    if AGENT_NETWORK not in main_networks:
-        main_networks.append(AGENT_NETWORK)
+    # Replace, rather than extend, inherited membership. Any shared fallback
+    # network would let the model bypass the policy gateway and reach Anvil.
+    main["networks"] = [AGENT_NETWORK]
     main.setdefault("depends_on", {})[POLICY_SERVICE] = {
         "condition": "service_healthy"
     }
+
+    anvil_environment = {
+        "ANVIL_HOST": "0.0.0.0",
+        "KEEP_ARCHIVE_RPC": "1",
+        "RPC_URL": "http://127.0.0.1:8545",
+        "ARCHIVE_RPC_URL": archive_rpc,
+        "CHAIN_ID": chain_id,
+        "ANVIL_HARDFORK": hardfork,
+        "FORK_BLOCK_NUMBER": fork_block,
+    }
+    if expected_block is not None:
+        anvil_environment["FORK_EXPECTED_BLOCK_NUMBER"] = expected_block
+    if target_timestamp is not None:
+        anvil_environment["FORK_TARGET_TIMESTAMP"] = target_timestamp
 
     services[ANVIL_SERVICE] = {
         "image": image,
@@ -67,14 +83,7 @@ def add_policy_services(
             "-lc",
             "start-anvil && exec tail -f /dev/null",
         ],
-        "environment": {
-            "ANVIL_HOST": "0.0.0.0",
-            "KEEP_ARCHIVE_RPC": "1",
-            "RPC_URL": "http://127.0.0.1:8545",
-            "ARCHIVE_RPC_URL": archive_rpc,
-            "CHAIN_ID": chain_id,
-            "ANVIL_HARDFORK": hardfork,
-        },
+        "environment": anvil_environment,
         "healthcheck": {
             "test": [
                 "CMD-SHELL",
@@ -155,6 +164,14 @@ class PinnedForkDockerEnvironment(DockerEnvironment):
         self._fork_block = self._persistent_env.get("FORK_BLOCK_NUMBER", "")
         if not self._fork_block.isdigit():
             raise ValueError("FORK_BLOCK_NUMBER must be a decimal integer")
+        self._expected_block = self._persistent_env.get(
+            "FORK_EXPECTED_BLOCK_NUMBER", self._fork_block
+        )
+        if not self._expected_block.isdigit():
+            raise ValueError("FORK_EXPECTED_BLOCK_NUMBER must be a decimal integer")
+        self._target_timestamp = self._persistent_env.get("FORK_TARGET_TIMESTAMP")
+        if self._target_timestamp is not None and not self._target_timestamp.isdigit():
+            raise ValueError("FORK_TARGET_TIMESTAMP must be a decimal integer")
         self._chain_id = self._persistent_env.get("CHAIN_ID", "1")
         if not self._chain_id.isdigit():
             raise ValueError("CHAIN_ID must be a decimal integer")
@@ -164,13 +181,14 @@ class PinnedForkDockerEnvironment(DockerEnvironment):
 
         # These are the only endpoints and explorer credential visible to the
         # agent. The real archive URL and Etherscan key stay in sidecars.
-        for secret_name in (
-            "ARCHIVE_RPC_URL",
-            "ETH_RPC_URL",
-            "BASE_RPC_URL",
-            "KEEP_ARCHIVE_RPC",
-        ):
-            self._persistent_env.pop(secret_name, None)
+        for secret_name in tuple(self._persistent_env):
+            upper = secret_name.upper()
+            if (
+                (upper.endswith("_RPC_URL") and upper != "RPC_URL")
+                or upper.startswith(("ARCHIVE_RPC_", "RL_TASK_POLICY_"))
+                or upper == "KEEP_ARCHIVE_RPC"
+            ):
+                self._persistent_env.pop(secret_name, None)
         self._persistent_env.update(
             {
                 "RPC_URL": f"http://{POLICY_SERVICE}:8545",
@@ -199,6 +217,8 @@ class PinnedForkDockerEnvironment(DockerEnvironment):
             archive_rpc=self._archive_rpc,
             etherscan_api_key=self._etherscan_api_key,
             fork_block=self._fork_block,
+            expected_block=self._expected_block,
+            target_timestamp=self._target_timestamp,
             chain_id=self._chain_id,
             hardfork=self._hardfork,
         )

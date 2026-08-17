@@ -19,11 +19,14 @@ expect_rejection() {
   echo "[adversarial] rejected: $description"
 }
 
-for task_id in notional-v1 trusted-volumes projekt-reward-vault rwa-vault prxvt aztec-v2 bunni-v2; do
+for task_file in "$repo_root"/tasks/*/task.toml; do
+  task_id=$(basename "$(dirname "$task_file")")
   expect_rejection "$task_id" NoopExploit.sol "$task_id no-op submission"
 done
 
-expect_rejection prxvt PrxvtRoundTripExploit.sol \
-  "ordinary constructor stake followed by ordinary withdrawal"
+if [[ -d "$repo_root/tasks/2026-01-01-prxvt" ]]; then
+  expect_rejection 2026-01-01-prxvt PrxvtRoundTripExploit.sol \
+    "ordinary constructor stake followed by ordinary withdrawal"
+fi
 
 echo "[adversarial] grader regression controls passed"

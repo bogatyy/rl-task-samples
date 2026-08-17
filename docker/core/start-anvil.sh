@@ -8,11 +8,23 @@ chain_id=${CHAIN_ID:-1}
 hardfork=${ANVIL_HARDFORK:-osaka}
 fork_block=${FORK_BLOCK_NUMBER:?FORK_BLOCK_NUMBER is required}
 expected_block=${FORK_EXPECTED_BLOCK_NUMBER:-$fork_block}
-replay=${FORK_REPLAY_TRANSACTION_HASHES:-}
 timestamp=${FORK_TARGET_TIMESTAMP:-}
-storage_patches=${FORK_STORAGE_PATCHES:-}
 pid_file=/tmp/rl-task-anvil.pid
 log_file=/tmp/rl-task-anvil.log
+relay_pid_file=/tmp/rl-task-archive-relay.pid
+relay_log_file=/tmp/rl-task-archive-relay.log
+relay_port_file=/tmp/rl-task-archive-relay.port
+relay_pid=""
+pid=""
+keep_children=0
+
+cleanup_failed_start() {
+  if (( keep_children == 0 )); then
+    [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true
+    [[ -z "$relay_pid" ]] || kill "$relay_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup_failed_start EXIT
 
 if [[ "${1:-}" == --restart ]]; then
   if [[ -f "$pid_file" ]]; then
@@ -20,7 +32,13 @@ if [[ "${1:-}" == --restart ]]; then
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   fi
-  rm -f "$pid_file"
+  if [[ -f "$relay_pid_file" ]]; then
+    relay_pid=$(<"$relay_pid_file")
+    kill "$relay_pid" 2>/dev/null || true
+    wait "$relay_pid" 2>/dev/null || true
+    relay_pid=""
+  fi
+  rm -f "$pid_file" "$relay_pid_file" "$relay_port_file"
 fi
 
 if current=$(cast block-number --rpc-url "$rpc_url" 2>/dev/null); then
@@ -30,7 +48,25 @@ if current=$(cast block-number --rpc-url "$rpc_url" 2>/dev/null); then
 fi
 
 : "${archive_url:?an archive RPC is required}"
-anvil --fork-url "$archive_url" --fork-block-number "$fork_block" \
+rm -f "$relay_port_file"
+printf '%s\n' "$archive_url" | ARCHIVE_RELAY_PORT=8546 \
+  ARCHIVE_RELAY_PORT_FILE="$relay_port_file" \
+  python3 /usr/local/lib/rl-task/archive_relay.py >"$relay_log_file" 2>&1 &
+relay_pid=$!
+echo "$relay_pid" > "$relay_pid_file"
+for _ in $(seq 1 120); do
+  [[ -s "$relay_port_file" ]] && break
+  kill -0 "$relay_pid" 2>/dev/null || {
+    echo "[task] archive relay failed to start" >&2
+    exit 1
+  }
+  sleep 0.1
+done
+[[ "$(<"$relay_port_file")" == 8546 ]]
+
+unset ARCHIVE_RPC_URL
+archive_url=""
+anvil --fork-url http://127.0.0.1:8546 --fork-block-number "$fork_block" \
   --chain-id "$chain_id" --host "$anvil_host" --port 8545 --hardfork "$hardfork" \
   --base-fee 0 --gas-price 0 --gas-limit 100000000 --silent \
   >"$log_file" 2>&1 &
@@ -48,34 +84,10 @@ for _ in $(seq 1 120); do
 done
 [[ "$current" == "$fork_block" ]] || exit 1
 
-if [[ -n "$storage_patches" ]]; then
-  IFS=',' read -r -a patches <<< "$storage_patches"
-  for patch in "${patches[@]}"; do
-    IFS=':' read -r target slot value extra <<< "$patch"
-    [[ -n "$target" && -n "$slot" && -n "$value" && -z "${extra:-}" ]] || exit 1
-    cast rpc --rpc-url "$rpc_url" anvil_setStorageAt "$target" "$slot" "$value" >/dev/null
-    [[ "$(cast storage "$target" "$slot" --rpc-url "$rpc_url")" == "$value" ]] || exit 1
-  done
-fi
-
-if [[ -n "$replay" ]]; then
-  cast rpc --rpc-url "$rpc_url" evm_setAutomine false >/dev/null
-  IFS=',' read -r -a hashes <<< "$replay"
-  for hash in "${hashes[@]}"; do
-    raw=$(cast rpc --rpc-url "$archive_url" eth_getRawTransactionByHash "$hash")
-    [[ -n "$raw" && "$raw" != null ]] || exit 1
-    cast rpc --rpc-url "$rpc_url" eth_sendRawTransaction "$raw" >/dev/null
-  done
-fi
-
 if [[ -n "$timestamp" ]]; then
   cast rpc --rpc-url "$rpc_url" evm_setNextBlockTimestamp "$timestamp" >/dev/null
-fi
-
-if [[ -n "$replay" || -n "$timestamp" ]]; then
   cast rpc --rpc-url "$rpc_url" evm_mine >/dev/null
 fi
-[[ -z "$replay" ]] || cast rpc --rpc-url "$rpc_url" evm_setAutomine true >/dev/null
 
 current=$(cast block-number --rpc-url "$rpc_url")
 [[ "$current" == "$expected_block" ]] || {
@@ -83,3 +95,4 @@ current=$(cast block-number --rpc-url "$rpc_url")
   exit 1
 }
 echo "[task] Anvil ready at block $current"
+keep_children=1

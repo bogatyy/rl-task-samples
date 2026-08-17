@@ -36,8 +36,6 @@ fi
 
 cp "$artifact" /app/src/Exploit.sol
 cp /tests/ExploitGrader.sol /app/src/ExploitGrader.sol
-mkdir -p /app/script
-cp /opt/rl-verifier/Grade.s.sol /app/script/Grade.s.sol
 
 if ! (cd /app && forge build --offline) 2>&1 | tee -a "$run_log"; then
   result 0 "submission did not compile"
@@ -46,16 +44,30 @@ fi
 
 run_grade() {
   local expected=${FORK_EXPECTED_BLOCK_NUMBER:-$FORK_BLOCK_NUMBER}
+  local private_key=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+  local deployment deploy_status grader send_output send_status passed
   start-anvil --restart 2>&1 | tee -a "$run_log" || return 1
   [[ "$(cast block-number --rpc-url "$RPC_URL")" == "$expected" ]] || return 1
-  (
-    cd /app
-    forge script script/Grade.s.sol:GradeScript --offline --broadcast \
-      --rpc-url "$RPC_URL" \
-      --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
-      --gas-price 0 --priority-gas-price 0 --gas-estimate-multiplier 300 -vv
-  ) 2>&1 | tee -a "$run_log"
-  return ${PIPESTATUS[0]}
+
+  deployment=$(cd /app && forge create src/ExploitGrader.sol:ExploitGrader \
+    --offline --broadcast --rpc-url "$RPC_URL" --private-key "$private_key" \
+    --value "${GRADER_STARTING_VALUE:-1ether}" --gas-limit 100000000 \
+    --legacy --gas-price 0 -vv 2>&1)
+  deploy_status=$?
+  printf '%s\n' "$deployment" | tee -a "$run_log"
+  (( deploy_status == 0 )) || return 1
+
+  grader=$(printf '%s\n' "$deployment" | awk '/Deployed to:/ {print $3}' | tail -1)
+  [[ "$grader" =~ ^0x[0-9a-fA-F]{40}$ ]] || return 1
+
+  send_output=$(cast send "$grader" 'grade()' --rpc-url "$RPC_URL" --private-key "$private_key" \
+    --gas-limit 100000000 --legacy --gas-price 0 2>&1)
+  send_status=$?
+  printf '%s\n' "$send_output" | tee -a "$run_log"
+  (( send_status == 0 )) || return 1
+
+  passed=$(cast call "$grader" 'passed()(bool)' --rpc-url "$RPC_URL" | awk '{print $1}')
+  [[ "$passed" == true ]]
 }
 
 passed=0

@@ -4,20 +4,19 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 requested=${1:-all}
 exploit_override=${SMOKE_EXPLOIT_PATH:-}
-next_port=18544
-rpc_url=http://127.0.0.1:18545
+# Independent smoke invocations must not share a fork. Use a process-scoped
+# default range; callers that intentionally coordinate ports may still set
+# SMOKE_PORT_BASE explicitly.
+next_port=${SMOKE_PORT_BASE:-$((20000 + ($$ % 30000)))}
+rpc_url="http://127.0.0.1:$((next_port + 1))"
 private_key=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 anvil_pid=""
+archive_relay_pid=""
 
-tasks=(
-  notional-v1
-  trusted-volumes
-  projekt-reward-vault
-  rwa-vault
-  prxvt
-  aztec-v2
-  bunni-v2
-)
+tasks=()
+for task_file in "$repo_root"/tasks/*/task.toml; do
+  tasks+=("$(basename "$(dirname "$task_file")")")
+done
 
 source_env_file() {
   local env_file=$1
@@ -34,18 +33,86 @@ if [[ -f "$repo_root/.env" ]]; then
 elif [[ -f "$repo_root/../env.sh" ]]; then
   source_env_file "$repo_root/../env.sh"
 fi
-if [[ "$requested" == "all" || "$requested" == "prxvt" ]]; then
-  : "${BASE_RPC_URL:?set BASE_RPC_URL to a Base archive RPC}"
-fi
-if [[ "$requested" != "prxvt" ]]; then
-  : "${ETH_RPC_URL:?set ETH_RPC_URL to an Ethereum archive RPC}"
-fi
-
 if [[ "$requested" != "all" ]]; then
   valid=0
   for task_id in "${tasks[@]}"; do [[ "$requested" == "$task_id" ]] && valid=1; done
   (( valid == 1 )) || { echo "unknown smoke task: $requested" >&2; exit 2; }
 fi
+
+task_chain() {
+  awk -F'"' '/^chain = / { print $2; exit }' "$repo_root/tasks/$1/task.toml"
+}
+
+rpc_variable_for_chain() {
+  case "$1" in
+    ethereum) echo ETH_RPC_URL ;;
+    bsc) echo BSC_RPC_URL ;;
+    arbitrum) echo ARBITRUM_RPC_URL ;;
+    base) echo BASE_RPC_URL ;;
+    polygon) echo POLYGON_RPC_URL ;;
+    avalanche) echo AVALANCHE_RPC_URL ;;
+    optimism) echo OPTIMISM_RPC_URL ;;
+    linea) echo LINEA_RPC_URL ;;
+    blast) echo BLAST_RPC_URL ;;
+    gnosis) echo GNOSIS_RPC_URL ;;
+    mantle) echo MANTLE_RPC_URL ;;
+    sei) echo SEI_RPC_URL ;;
+    *) echo "unsupported task chain: $1" >&2; return 2 ;;
+  esac
+}
+
+alchemy_network_for_chain() {
+  case "$1" in
+    ethereum) echo eth-mainnet ;;
+    bsc) echo bnb-mainnet ;;
+    arbitrum) echo arb-mainnet ;;
+    base) echo base-mainnet ;;
+    polygon) echo polygon-mainnet ;;
+    avalanche) echo avax-mainnet ;;
+    optimism) echo opt-mainnet ;;
+    linea) echo linea-mainnet ;;
+    blast) echo blast-mainnet ;;
+    gnosis) echo gnosis-mainnet ;;
+    mantle) echo mantle-mainnet ;;
+    sei) echo sei-mainnet ;;
+    *) echo "unsupported task chain: $1" >&2; return 2 ;;
+  esac
+}
+
+archive_rpc_for_task() {
+  local task_id=$1 chain rpc_variable alchemy_network
+  chain=$(task_chain "$task_id")
+  rpc_variable=$(rpc_variable_for_chain "$chain")
+  if [[ -n "${ALCHEMY_API_KEY:-}" ]]; then
+    alchemy_network=$(alchemy_network_for_chain "$chain")
+    printf 'https://%s.g.alchemy.com/v2/%s' "$alchemy_network" "$ALCHEMY_API_KEY"
+    return
+  fi
+  [[ -n "${!rpc_variable:-}" ]] || {
+    echo "set ALCHEMY_API_KEY or $rpc_variable for $chain archive access" >&2
+    return 2
+  }
+  printf '%s' "${!rpc_variable}"
+}
+
+task_environment_value() {
+  local task_id=$1 key=$2
+  awk -v key="$key" '
+    $1 == "ENV" && index($2, key "=") == 1 {
+      sub("^" key "=", "", $2)
+      print $2
+    }
+  ' "$repo_root/tasks/$task_id/environment/Dockerfile" | tail -1
+}
+
+task_verifier_value() {
+  local task_id=$1 key=$2
+  awk -F'"' -v key="$key" '
+    /^\[verifier\.env\]$/ { in_section=1; next }
+    in_section && /^\[/ { exit }
+    in_section && $1 ~ "^" key "[[:space:]]*=[[:space:]]*$" { print $2; exit }
+  ' "$repo_root/tasks/$task_id/task.toml"
+}
 
 smoke_root=$(mktemp -d /tmp/rl-smoke.XXXXXX)
 stop_anvil() {
@@ -53,14 +120,18 @@ stop_anvil() {
     kill "$anvil_pid" 2>/dev/null || true
     wait "$anvil_pid" 2>/dev/null || true
     anvil_pid=""
-    for _ in $(seq 1 40); do
-      cast block-number --rpc-url "$rpc_url" >/dev/null 2>&1 || break
-      sleep 0.1
-    done
+  fi
+}
+stop_archive_relay() {
+  if [[ -n "$archive_relay_pid" ]]; then
+    kill "$archive_relay_pid" 2>/dev/null || true
+    wait "$archive_relay_pid" 2>/dev/null || true
+    archive_relay_pid=""
   fi
 }
 cleanup() {
   stop_anvil
+  stop_archive_relay
   if [[ "${SMOKE_KEEP_TMP:-0}" == 1 ]]; then
     echo "[smoke] kept diagnostics at $smoke_root" >&2
   else
@@ -68,6 +139,12 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+terminate() {
+  trap - EXIT HUP INT TERM
+  cleanup
+  exit 143
+}
+trap terminate HUP INT TERM
 
 prepare_project() {
   local task_id=$1
@@ -83,8 +160,7 @@ prepare_project() {
   cp -R "$task_dir/environment/project/." "$project_dir/"
   cp "$exploit_source" "$project_dir/src/Exploit.sol"
   cp "$task_dir/tests/ExploitGrader.sol" "$project_dir/src/ExploitGrader.sol"
-  mkdir -p "$project_dir/script"
-  cp "$repo_root/docker/core/Grade.s.sol" "$project_dir/script/Grade.s.sol"
+  forge clean --root "$project_dir"
   forge build --root "$project_dir" --offline >/dev/null
   printf '%s\n' "$project_dir"
 }
@@ -93,17 +169,36 @@ start_fork() {
   local base_block=$1
   local expected_block=$2
   local target_timestamp=${3:-}
-  local replay_transactions=${4:-}
-  local storage_patches=${5:-}
-  local archive_url=${6:-${ETH_RPC_URL:-}}
-  local chain_id=${7:-1}
-  local hardfork=${8:-osaka}
+  local archive_url=${4:-${ETH_RPC_URL:-}}
+  local chain_id=${5:-1}
+  local hardfork=${6:-osaka}
   [[ -n "$archive_url" ]]
   stop_anvil
+  stop_archive_relay
   next_port=$((next_port + 1))
   rpc_url="http://127.0.0.1:$next_port"
 
-  anvil --fork-url "$archive_url" --fork-block-number "$base_block" \
+  local relay_port_file="$smoke_root/archive-relay.port"
+  local relay_port
+  rm -f "$relay_port_file"
+  printf '%s\n' "$archive_url" | ARCHIVE_RELAY_PORT=0 \
+    ARCHIVE_RELAY_PORT_FILE="$relay_port_file" \
+    python3 "$repo_root/docker/core/archive_relay.py" \
+    >"$smoke_root/archive-relay.log" 2>&1 &
+  archive_relay_pid=$!
+  for _ in $(seq 1 120); do
+    [[ -s "$relay_port_file" ]] && break
+    if ! kill -0 "$archive_relay_pid" 2>/dev/null; then
+      echo "[smoke] archive relay failed to start" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  relay_port=$(<"$relay_port_file")
+  [[ "$relay_port" =~ ^[0-9]+$ ]]
+  archive_url=""
+
+  anvil --fork-url "http://127.0.0.1:$relay_port" --fork-block-number "$base_block" \
     --chain-id "$chain_id" --host 127.0.0.1 --port "$next_port" --hardfork "$hardfork" \
     --base-fee 0 --gas-price 0 --gas-limit 100000000 --silent \
     >"$smoke_root/anvil.log" 2>&1 &
@@ -124,34 +219,9 @@ start_fork() {
     return 1
   }
 
-  if [[ -n "$storage_patches" ]]; then
-    IFS=',' read -r -a patches <<< "$storage_patches"
-    local patch target slot value extra
-    for patch in "${patches[@]}"; do
-      IFS=':' read -r target slot value extra <<< "$patch"
-      [[ -n "$target" && -n "$slot" && -n "$value" && -z "${extra:-}" ]]
-      cast rpc --rpc-url "$rpc_url" anvil_setStorageAt "$target" "$slot" "$value" >/dev/null
-      [[ "$(cast storage "$target" "$slot" --rpc-url "$rpc_url")" == "$value" ]]
-    done
-  fi
-
-  if [[ -n "$replay_transactions" ]]; then
-    cast rpc --rpc-url "$rpc_url" evm_setAutomine false >/dev/null
-    IFS=',' read -r -a replay_hashes <<< "$replay_transactions"
-    local transaction_hash raw_transaction
-    for transaction_hash in "${replay_hashes[@]}"; do
-      raw_transaction=$(cast rpc --rpc-url "$archive_url" eth_getRawTransactionByHash "$transaction_hash")
-      cast rpc --rpc-url "$rpc_url" eth_sendRawTransaction "$raw_transaction" >/dev/null
-    done
-  fi
   if [[ -n "$target_timestamp" ]]; then
     cast rpc --rpc-url "$rpc_url" evm_setNextBlockTimestamp "$target_timestamp" >/dev/null
-  fi
-  if [[ -n "$replay_transactions" || -n "$target_timestamp" ]]; then
     cast rpc --rpc-url "$rpc_url" evm_mine >/dev/null
-  fi
-  if [[ -n "$replay_transactions" ]]; then
-    cast rpc --rpc-url "$rpc_url" evm_setAutomine true >/dev/null
   fi
 
   current=$(cast block-number --rpc-url "$rpc_url")
@@ -162,110 +232,73 @@ start_fork() {
 }
 
 run_grade_script() {
-  local project_dir=$1
-  (
-    cd "$project_dir"
-    RPC_URL="$rpc_url" forge script script/Grade.s.sol:GradeScript --offline --broadcast \
-      --rpc-url "$rpc_url" --private-key "$private_key" \
-      --gas-price 0 --priority-gas-price 0 --gas-estimate-multiplier 300 -v
-  )
-}
-
-run_notional() {
-  local project_dir
-  project_dir=$(prepare_project notional-v1)
-  start_fork 25541000 25541000
-  run_grade_script "$project_dir"
-  echo "[smoke] notional-v1 passed"
-}
-
-run_trusted() {
-  local project_dir
-  project_dir=$(prepare_project trusted-volumes)
-  start_fork 25039669 25039669
-  run_grade_script "$project_dir"
-  echo "[smoke] trusted-volumes passed"
-}
-
-run_projekt() {
-  local project_dir replay
-  project_dir=$(prepare_project projekt-reward-vault)
-  replay=0xe4b70d3c3e745237b92212750763e69da88a79cd061cf9cc8f050b02cb1f0892,0x65c0732bac3590f8581669f49a55a0e32079ed77e050f243d772a8984c82641a
-  start_fork 25606411 25606412 "" "$replay"
-  run_grade_script "$project_dir"
-  echo "[smoke] projekt-reward-vault passed"
-}
-
-run_rwa_vault() {
-  local project_dir
-  project_dir=$(prepare_project rwa-vault)
-  start_fork 24979315 24979316 1777388411
-  run_grade_script "$project_dir"
-  echo "[smoke] rwa-vault passed"
-}
-
-run_prxvt() {
-  local project_dir
-  project_dir=$(prepare_project prxvt)
-  start_fork 40229652 40229652 "" "" "" "$BASE_RPC_URL" 8453 cancun
-  run_grade_script "$project_dir"
-  echo "[smoke] prxvt passed"
-}
-
-run_aztec() {
-  local project_dir storage_patches
-  project_dir=$(prepare_project aztec-v2)
-  storage_patches=0x737901bea3eeb88459df9ef1BE8fF3Ae1B42A2ba:0x1:0x2708a627d38d74d478f645ec3b4e91afa325331acf1acebe9077891146b75e39,0x737901bea3eeb88459df9ef1BE8fF3Ae1B42A2ba:0x2:0x2694dbe3c71a25d92213422d392479e7b8ef437add81e1e17244462e6edca9b1,0x737901bea3eeb88459df9ef1BE8fF3Ae1B42A2ba:0x3:0x2d264e93dc455751a721aead9dba9ee2a9fef5460921aeede73f63f6210e6851,0x737901bea3eeb88459df9ef1BE8fF3Ae1B42A2ba:0x4:0x0000000000000000000000000000000000000000000000000000000000000000,0x737901bea3eeb88459df9ef1BE8fF3Ae1B42A2ba:0x5:0x0000000000000000000000000000000000000000000000000000000000000000
-  start_fork 25295800 25295800 "" "" "$storage_patches"
-  run_grade_script "$project_dir"
-  echo "[smoke] aztec-v2 passed"
-}
-
-run_bunni() {
-  local project_dir deployment deploy_status grader exploit inventory
-  project_dir=$(prepare_project bunni-v2)
-  start_fork 23273097 23273098 1756787903
-
-  set +e
+  local task_id=$1 project_dir=$2 starting_value deployment grader passed_value grade_timeout
+  starting_value=$(task_verifier_value "$task_id" GRADER_STARTING_VALUE)
+  starting_value=${starting_value:-1ether}
+  grade_timeout=${SMOKE_GRADE_TIMEOUT:-300}
   deployment=$(cd "$project_dir" && forge create src/ExploitGrader.sol:ExploitGrader \
     --offline --broadcast --rpc-url "$rpc_url" --private-key "$private_key" \
-    --value 1ether --gas-limit 100000000 --gas-price 0 --priority-gas-price 0 -vvvv 2>&1)
-  deploy_status=$?
-  set -e
+    --value "$starting_value" --gas-limit 100000000 \
+    --legacy --gas-price 0 -vv)
+  printf '%s\n' "$deployment"
   grader=$(printf '%s\n' "$deployment" | awk '/Deployed to:/ {print $3}' | tail -1)
-  if (( deploy_status != 0 )) || [[ ! "$grader" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
-    printf '%s\n' "$deployment" >&2
-    echo "[smoke] bunni-v2 grader deployment failed" >&2
+  [[ "$grader" =~ ^0x[0-9a-fA-F]{40}$ ]]
+  if ! cast send "$grader" 'grade()' --rpc-url "$rpc_url" --private-key "$private_key" \
+    --gas-limit 100000000 --legacy --gas-price 0 --timeout "$grade_timeout" >/dev/null; then
+    passed_value=$(cast call "$grader" 'passed()(bool)' --rpc-url "$rpc_url" 2>/dev/null | awk '{print $1}')
+    if [[ "$passed_value" == true ]]; then
+      return 0
+    fi
+    echo "[smoke] grade transaction failed" >&2
+    cast call "$grader" 'grade()' --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
+      --rpc-url "$rpc_url" --gas-limit 100000000 >&2 2>&1 || true
+    if [[ "${SMOKE_TRACE_ON_FAILURE:-1}" == 1 ]]; then
+      echo "[smoke] local trace follows" >&2
+      cast call "$grader" 'grade()' --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
+        --rpc-url "$rpc_url" --gas-limit 100000000 --trace >&2 2>&1 || true
+    fi
     return 1
   fi
-  exploit=$(cast call "$grader" 'exploit()(address)' --rpc-url "$rpc_url" | awk '{print $1}')
+  passed_value=$(cast call "$grader" 'passed()(bool)' --rpc-url "$rpc_url" | awk '{print $1}')
+  if [[ "$passed_value" != true ]]; then
+    echo "[smoke] grader did not pass" >&2
+    cast call "$grader" 'grade()' --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
+      --rpc-url "$rpc_url" --gas-limit 100000000 >&2 2>&1 || true
+    if [[ "${SMOKE_TRACE_ON_FAILURE:-1}" == 1 ]]; then
+      echo "[smoke] local trace follows" >&2
+      cast call "$grader" 'grade()' --from 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
+        --rpc-url "$rpc_url" --gas-limit 100000000 --trace >&2 2>&1 || true
+    fi
+    return 1
+  fi
+}
 
-  local holder=0x657D8BcCDD9C6e1Da8DA1e7d331CFdeA8357AdBc
-  local lp=0xc92c2ba90213Fc3048A527052B0b4FeBFA716763
-  inventory=$(cast call "$lp" 'balanceOf(address)(uint256)' "$holder" --rpc-url "$rpc_url" | awk '{print $1}')
-  cast rpc --rpc-url "$rpc_url" anvil_impersonateAccount "$holder" >/dev/null
-  cast send "$lp" 'transfer(address,uint256)' "$exploit" "$inventory" --from "$holder" --unlocked \
-    --rpc-url "$rpc_url" --gas-price 0 --priority-gas-price 0 >/dev/null
-  cast send "$grader" 'grade()' --rpc-url "$rpc_url" --private-key "$private_key" \
-    --gas-limit 100000000 --gas-price 0 --priority-gas-price 0 >/dev/null
-  if [[ "$(cast call "$grader" 'passed()(bool)' --rpc-url "$rpc_url" | awk '{print $1}')" != "true" ]]; then
-    echo "[smoke] bunni-v2 grader did not pass" >&2
-    return 1
-  fi
-  echo "[smoke] bunni-v2 passed"
+start_task_fork() {
+  local task_id=$1 base expected timestamp archive chain_id hardfork
+  base=$(task_environment_value "$task_id" FORK_BLOCK_NUMBER)
+  [[ -n "$base" ]] || { echo "$task_id has no fork block" >&2; return 2; }
+  expected=$(task_environment_value "$task_id" FORK_EXPECTED_BLOCK_NUMBER)
+  expected=${expected:-$base}
+  timestamp=$(task_environment_value "$task_id" FORK_TARGET_TIMESTAMP)
+  chain_id=$(task_environment_value "$task_id" CHAIN_ID)
+  chain_id=${chain_id:-1}
+  hardfork=$(task_environment_value "$task_id" ANVIL_HARDFORK)
+  hardfork=${hardfork:-osaka}
+  archive=$(archive_rpc_for_task "$task_id")
+  start_fork "$base" "$expected" "$timestamp" "$archive" "$chain_id" "$hardfork"
+}
+
+run_generic() {
+  local task_id=$1 project_dir
+  project_dir=$(prepare_project "$task_id")
+  start_task_fork "$task_id"
+  run_grade_script "$task_id" "$project_dir"
+  echo "[smoke] $task_id passed"
 }
 
 for task_id in "${tasks[@]}"; do
   if [[ "$requested" == "all" || "$requested" == "$task_id" ]]; then
-    case "$task_id" in
-      notional-v1) run_notional ;;
-      trusted-volumes) run_trusted ;;
-      projekt-reward-vault) run_projekt ;;
-      rwa-vault) run_rwa_vault ;;
-      prxvt) run_prxvt ;;
-      aztec-v2) run_aztec ;;
-      bunni-v2) run_bunni ;;
-    esac
+    run_generic "$task_id"
   fi
 done
 

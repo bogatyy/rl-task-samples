@@ -1,26 +1,26 @@
 [dataset]
-name = "rl-exploits/smoke"
-description = "Whitehat RL environments for reproducing publicly known on-chain opportunities"
-authors = []
-keywords = ["ethereum", "foundry", "defi", "security", "rl"]
+name = "rl-task-samples"
+description = "A curated sample of historical EVM exploit-reproduction environments"
+authors = ["Ivan Bogatyy"]
+keywords = ["smart-contracts", "security", "reinforcement-learning", "foundry"]
 
 [[tasks]]
-name = "rl-exploits/notional-v1"
+name = "rl-exploits/2026-07-15-notional-v1"
 
 [[tasks]]
-name = "rl-exploits/trusted-volumes"
+name = "rl-exploits/2026-07-01-edel-xstock"
 
 [[tasks]]
-name = "rl-exploits/projekt-reward-vault"
+name = "rl-exploits/2026-06-17-lbp"
 
 [[tasks]]
-name = "rl-exploits/rwa-vault"
+name = "rl-exploits/2026-06-07-ambient"
 
 [[tasks]]
-name = "rl-exploits/prxvt"
+name = "rl-exploits/2026-04-28-rwa-vault"
 
 [[tasks]]
-name = "rl-exploits/aztec-v2"
+name = "rl-exploits/2025-11-03-balancer-v2"
 
 [[tasks]]
-name = "rl-exploits/bunni-v2"
+name = "rl-exploits/2024-09-03-penpie"

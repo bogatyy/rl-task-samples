@@ -14,10 +14,10 @@ COPY start-anvil.sh /usr/local/bin/start-anvil
 COPY entrypoint.sh /usr/local/bin/task-entrypoint
 COPY mini-swe-agent-wrapper.sh /usr/local/bin/mini-swe-agent-wrapper
 COPY collect_artifact.py /usr/local/bin/collect-exploit-artifact
+COPY archive_relay.py /usr/local/lib/rl-task/archive_relay.py
 COPY policy_gateway.py /usr/local/lib/rl-task/policy_gateway.py
 COPY rl_agent/ /opt/rl-agent/rl_agent/
 COPY verifier.sh /usr/local/bin/verify-task
-COPY Grade.s.sol /opt/rl-verifier/Grade.s.sol
 COPY project/ /opt/rl-foundry-project/
 
 RUN forge build --root /opt/rl-foundry-project \
