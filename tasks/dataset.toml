@@ -5,6 +5,9 @@ authors = ["Ivan Bogatyy"]
 keywords = ["smart-contracts", "security", "reinforcement-learning", "foundry"]
 
 [[tasks]]
+name = "rl-exploits/2026-09-15-rseth-safe-module"
+
+[[tasks]]
 name = "rl-exploits/2026-07-15-notional-v1"
 
 [[tasks]]

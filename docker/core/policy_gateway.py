@@ -35,6 +35,13 @@ MAX_FEE_HISTORY_BLOCKS = 8_192
 MAX_BACKEND_CONCURRENCY = 16
 MAX_SOURCE_CONCURRENCY = 4
 
+# Etherscan V2 does not cover every Alchemy-backed EVM chain. Keep the same
+# source-only query policy while routing those chains to a compatible verified
+# source endpoint. Unlike Etherscan, these public endpoints receive no API key.
+SOURCE_API_OVERRIDES = {
+    "1088": "https://andromeda-explorer.metis.io/api",
+}
+
 
 class PolicyError(Exception):
     def __init__(self, message: str, code: int = -32004):
@@ -80,6 +87,34 @@ def validate_source_query(path: str, chain_id: str = "1") -> str:
     if not ADDRESS_RE.fullmatch(address):
         raise PolicyError("invalid contract address")
     return address
+
+
+def source_api_request(chain_id: str, address: str, api_key: str) -> urllib.request.Request:
+    override = SOURCE_API_OVERRIDES.get(chain_id)
+    if override is not None:
+        query = urllib.parse.urlencode(
+            {
+                "module": "contract",
+                "action": "getsourcecode",
+                "address": address,
+            }
+        )
+        url = f"{override}?{query}"
+    else:
+        query = urllib.parse.urlencode(
+            {
+                "chainid": chain_id,
+                "module": "contract",
+                "action": "getsourcecode",
+                "address": address,
+                "apikey": api_key,
+            }
+        )
+        url = f"https://api.etherscan.io/v2/api?{query}"
+    return urllib.request.Request(
+        url,
+        headers={"User-Agent": "rl-task-source-gateway/1"},
+    )
 
 
 class Backend:
@@ -544,19 +579,7 @@ def source_handler(api_key: str, chain_id: str) -> type[QuietHandler]:
                 if cached is not None:
                     self.send_body(200, cached, "application/json")
                     return
-                query = urllib.parse.urlencode(
-                    {
-                        "chainid": chain_id,
-                        "module": "contract",
-                        "action": "getsourcecode",
-                        "address": address,
-                        "apikey": api_key,
-                    }
-                )
-                request = urllib.request.Request(
-                    f"https://api.etherscan.io/v2/api?{query}",
-                    headers={"User-Agent": "rl-task-source-gateway/1"},
-                )
+                request = source_api_request(chain_id, address, api_key)
                 with source_semaphore:
                     with opener.open(request, timeout=60) as response:
                         body = response.read(MAX_SOURCE_BYTES + 1)

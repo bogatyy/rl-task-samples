@@ -6,6 +6,7 @@ from policy_gateway import (
     PolicyError,
     RpcPolicy,
     safe_backend_error,
+    source_api_request,
     validate_source_query,
 )
 
@@ -127,6 +128,20 @@ class SourcePolicyTests(unittest.TestCase):
                 f"/api?chainid=1&module=contract&action=getsourcecode&address={address}",
                 "8453",
             )
+
+    def test_metis_source_request_uses_public_explorer_without_secret(self):
+        address = "0x" + "12" * 20
+        request = source_api_request("1088", address, "secret-key")
+        self.assertTrue(request.full_url.startswith("https://andromeda-explorer.metis.io/api?"))
+        self.assertIn(f"address={address}", request.full_url)
+        self.assertNotIn("secret-key", request.full_url)
+
+    def test_etherscan_source_request_keeps_v2_chain_and_key(self):
+        address = "0x" + "12" * 20
+        request = source_api_request("8453", address, "secret-key")
+        self.assertTrue(request.full_url.startswith("https://api.etherscan.io/v2/api?"))
+        self.assertIn("chainid=8453", request.full_url)
+        self.assertIn("apikey=secret-key", request.full_url)
 
 
 class RpcPolicyTests(unittest.TestCase):

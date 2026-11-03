@@ -24,6 +24,7 @@ ALCHEMY_ARCHIVE_VARS = {
     "gnosis": "GNOSIS_RPC_URL",
     "linea": "LINEA_RPC_URL",
     "mantle": "MANTLE_RPC_URL",
+    "metis": "METIS_RPC_URL",
     "optimism": "OPTIMISM_RPC_URL",
     "polygon": "POLYGON_RPC_URL",
     "sei": "SEI_RPC_URL",
@@ -58,6 +59,7 @@ def main() -> None:
         "polygon": "POL",
         "gnosis": "xDAI",
         "mantle": "MNT",
+        "metis": "METIS",
         "sei": "SEI",
     }.get(args.chain, "ETH")
 

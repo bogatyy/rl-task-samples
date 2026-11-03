@@ -67,13 +67,14 @@ done
 unset ARCHIVE_RPC_URL
 archive_url=""
 anvil --fork-url http://127.0.0.1:8546 --fork-block-number "$fork_block" \
+  --accounts 1 \
   --chain-id "$chain_id" --host "$anvil_host" --port 8545 --hardfork "$hardfork" \
   --base-fee 0 --gas-price 0 --gas-limit 100000000 --silent \
   >"$log_file" 2>&1 &
 pid=$!
 echo "$pid" > "$pid_file"
 
-for _ in $(seq 1 120); do
+for _ in $(seq 1 480); do
   current=$(cast block-number --rpc-url "$rpc_url" 2>/dev/null || true)
   [[ "$current" == "$fork_block" ]] && break
   if ! kill -0 "$pid" 2>/dev/null; then

@@ -56,6 +56,7 @@ rpc_variable_for_chain() {
     blast) echo BLAST_RPC_URL ;;
     gnosis) echo GNOSIS_RPC_URL ;;
     mantle) echo MANTLE_RPC_URL ;;
+    metis) echo METIS_RPC_URL ;;
     sei) echo SEI_RPC_URL ;;
     *) echo "unsupported task chain: $1" >&2; return 2 ;;
   esac
@@ -74,6 +75,7 @@ alchemy_network_for_chain() {
     blast) echo blast-mainnet ;;
     gnosis) echo gnosis-mainnet ;;
     mantle) echo mantle-mainnet ;;
+    metis) echo metis-mainnet ;;
     sei) echo sei-mainnet ;;
     *) echo "unsupported task chain: $1" >&2; return 2 ;;
   esac
@@ -83,6 +85,10 @@ archive_rpc_for_task() {
   local task_id=$1 chain rpc_variable alchemy_network
   chain=$(task_chain "$task_id")
   rpc_variable=$(rpc_variable_for_chain "$chain")
+  if [[ -n "${SMOKE_ARCHIVE_RPC_URL:-}" ]]; then
+    printf '%s' "$SMOKE_ARCHIVE_RPC_URL"
+    return
+  fi
   if [[ -n "${ALCHEMY_API_KEY:-}" ]]; then
     alchemy_network=$(alchemy_network_for_chain "$chain")
     printf 'https://%s.g.alchemy.com/v2/%s' "$alchemy_network" "$ALCHEMY_API_KEY"
@@ -161,7 +167,7 @@ prepare_project() {
   cp "$exploit_source" "$project_dir/src/Exploit.sol"
   cp "$task_dir/tests/ExploitGrader.sol" "$project_dir/src/ExploitGrader.sol"
   forge clean --root "$project_dir"
-  forge build --root "$project_dir" --offline >/dev/null
+  forge build --root "$project_dir" --offline --force --no-cache >/dev/null
   printf '%s\n' "$project_dir"
 }
 
@@ -199,12 +205,13 @@ start_fork() {
   archive_url=""
 
   anvil --fork-url "http://127.0.0.1:$relay_port" --fork-block-number "$base_block" \
+    --accounts 1 \
     --chain-id "$chain_id" --host 127.0.0.1 --port "$next_port" --hardfork "$hardfork" \
     --base-fee 0 --gas-price 0 --gas-limit 100000000 --silent \
     >"$smoke_root/anvil.log" 2>&1 &
   anvil_pid=$!
 
-  for _ in $(seq 1 120); do
+  for _ in $(seq 1 480); do
     cast block-number --rpc-url "$rpc_url" >/dev/null 2>&1 && break
     if ! kill -0 "$anvil_pid" 2>/dev/null; then
       echo "[smoke] Anvil failed to start; backend details were withheld to protect the archive credential" >&2
@@ -232,17 +239,20 @@ start_fork() {
 }
 
 run_grade_script() {
-  local task_id=$1 project_dir=$2 starting_value deployment grader passed_value grade_timeout
+  local task_id=$1 project_dir=$2 starting_value deployment grader passed_value grade_timeout deployment_timestamp
   starting_value=$(task_verifier_value "$task_id" GRADER_STARTING_VALUE)
   starting_value=${starting_value:-1ether}
-  grade_timeout=${SMOKE_GRADE_TIMEOUT:-300}
+  grade_timeout=${SMOKE_GRADE_TIMEOUT:-$(task_verifier_value "$task_id" GRADE_TIMEOUT)}
+  grade_timeout=${grade_timeout:-300}
   deployment=$(cd "$project_dir" && forge create src/ExploitGrader.sol:ExploitGrader \
-    --offline --broadcast --rpc-url "$rpc_url" --private-key "$private_key" \
+    --offline --force --no-cache --broadcast --rpc-url "$rpc_url" --private-key "$private_key" \
     --value "$starting_value" --gas-limit 100000000 \
     --legacy --gas-price 0 -vv)
   printf '%s\n' "$deployment"
   grader=$(printf '%s\n' "$deployment" | awk '/Deployed to:/ {print $3}' | tail -1)
   [[ "$grader" =~ ^0x[0-9a-fA-F]{40}$ ]]
+  deployment_timestamp=$(cast block latest --field timestamp --rpc-url "$rpc_url")
+  cast rpc --rpc-url "$rpc_url" evm_setNextBlockTimestamp "$((deployment_timestamp + 1))" >/dev/null
   if ! cast send "$grader" 'grade()' --rpc-url "$rpc_url" --private-key "$private_key" \
     --gas-limit 100000000 --legacy --gas-price 0 --timeout "$grade_timeout" >/dev/null; then
     passed_value=$(cast call "$grader" 'passed()(bool)' --rpc-url "$rpc_url" 2>/dev/null | awk '{print $1}')

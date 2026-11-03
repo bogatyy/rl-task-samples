@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 [[ -f "$repo_root/AGENTS.md" ]]
-[[ -f "$repo_root/tasks/EXCLUSIONS.md" ]]
+# This curated sample does not carry the full dataset's exclusion ledger.
 grep -q '^## Eligibility gate$' "$repo_root/AGENTS.md"
 grep -q '^## Harness invariants$' "$repo_root/AGENTS.md"
 grep -q '^## Grader contract$' "$repo_root/AGENTS.md"
@@ -16,6 +16,9 @@ done < <(
     | sed 's#/task.toml$##' | xargs -n1 basename | LC_ALL=C sort -r
 )
 (( ${#tasks[@]} > 0 ))
+
+python3 "$repo_root/scripts/check_starter_stubs.py"
+python3 "$repo_root/scripts/test_check_starter_stubs.py" -q
 
 while IFS= read -r script; do
   bash -n "$script"
@@ -74,6 +77,8 @@ grep -q 'archive_relay.py' "$repo_root/docker/core/start-anvil.sh"
 grep -q 'archive_relay.py' "$repo_root/scripts/smoke_test.sh"
 ! grep -Fq 'anvil --fork-url "$archive_url"' \
   "$repo_root/docker/core/start-anvil.sh" "$repo_root/scripts/smoke_test.sh"
+grep -q -- '--accounts 1' "$repo_root/docker/core/start-anvil.sh"
+grep -q -- '--accounts 1' "$repo_root/scripts/smoke_test.sh"
 ! grep -R -q \
   'anvil_setStorageAt\|anvil_impersonateAccount\|FORK_REPLAY_TRANSACTION_HASHES\|FORK_STORAGE_PATCHES' \
   "$repo_root/docker/core/start-anvil.sh" "$repo_root/scripts/smoke_test.sh" "$repo_root/tasks"
@@ -85,7 +90,7 @@ echo "[validate] model and verifier layers passed static validation"
 
 for variable in ALCHEMY_API_KEY ETH_RPC_URL BASE_RPC_URL BSC_RPC_URL ARBITRUM_RPC_URL \
   POLYGON_RPC_URL AVALANCHE_RPC_URL OPTIMISM_RPC_URL \
-  LINEA_RPC_URL BLAST_RPC_URL GNOSIS_RPC_URL MANTLE_RPC_URL SEI_RPC_URL \
+  LINEA_RPC_URL BLAST_RPC_URL GNOSIS_RPC_URL MANTLE_RPC_URL METIS_RPC_URL SEI_RPC_URL \
   ETHERSCAN_API_KEY DEEPSEEK_API_KEY \
   OPENROUTER_API_KEY; do
   grep -q "^${variable}=$" "$repo_root/.env.example"
@@ -242,6 +247,7 @@ chain_vars = {
     "optimism": "OPTIMISM_RPC_URL",
     "linea": "LINEA_RPC_URL", "blast": "BLAST_RPC_URL",
     "gnosis": "GNOSIS_RPC_URL", "mantle": "MANTLE_RPC_URL",
+    "metis": "METIS_RPC_URL",
     "sei": "SEI_RPC_URL",
 }
 task_dirs = sorted(
@@ -250,12 +256,6 @@ task_dirs = sorted(
     reverse=True,
 )
 ids = [path.name for path in task_dirs]
-exclusions = (root / "tasks/EXCLUSIONS.md").read_text()
-excluded_dates = re.findall(
-    r"^- \*\*([0-9]{4}-[0-9]{2}-[0-9]{2}) — ", exclusions, re.MULTILINE
-)
-if excluded_dates != sorted(excluded_dates, reverse=True):
-    raise SystemExit("tasks/EXCLUSIONS.md entries must be in reverse chronological order")
 dataset_text = (root / "tasks/dataset.toml").read_text()
 listed = [
     match.group(1)
@@ -324,8 +324,12 @@ for task_dir in task_dirs:
     for key in (
         "FORK_BLOCK_NUMBER", "FORK_EXPECTED_BLOCK_NUMBER", "FORK_TARGET_TIMESTAMP"
     ):
-        if key in env and f"ENV {key}={env[key]}" not in dockerfile:
-            raise SystemExit(f"{task_id}: image {key} mismatch")
+        image_value = re.search(rf"^ENV {key}=([^\s]+)$", dockerfile, re.MULTILINE)
+        if key in env:
+            if image_value is None or image_value.group(1) != str(env[key]):
+                raise SystemExit(f"{task_id}: image {key} mismatch")
+        elif image_value is not None:
+            raise SystemExit(f"{task_id}: task.toml omits image {key}")
     if "ARCHIVE_RPC_URL" in env or any(key.endswith("_RPC_URL") and key != "RPC_URL" for key in env):
         raise SystemExit(f"{task_id}: archive RPC exposed to agent")
     base_block = env.get("FORK_BLOCK_NUMBER")

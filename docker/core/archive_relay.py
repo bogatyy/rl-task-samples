@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -14,6 +15,14 @@ from pathlib import Path
 
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+TRANSIENT_ARCHIVE_RETRIES = 5
+
+
+class ArchiveRelayServer(ThreadingHTTPServer):
+    # Anvil fetches its prefunded accounts concurrently while constructing the
+    # fork genesis.  The stdlib server's default backlog of five is too small
+    # when an archive backend is slow enough for those requests to overlap.
+    request_queue_size = 128
 
 
 def upstream_secrets(upstream_url: str) -> tuple[bytes, ...]:
@@ -47,8 +56,6 @@ def forward_json_rpc(upstream_url: str, payload: bytes, opener) -> tuple[int, by
 
 
 def relay_handler(upstream_url: str):
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
     class ArchiveRelayHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             if self.path != "/health":
@@ -71,9 +78,25 @@ def relay_handler(upstream_url: str):
                 return
 
             try:
-                status, body = forward_json_rpc(
-                    upstream_url, self.rfile.read(length), opener
-                )
+                # urllib openers carry mutable handler state and are not safe
+                # to share across ThreadingHTTPServer workers. Anvil issues a
+                # burst of concurrent genesis reads, so give each request its
+                # own proxy-free opener instead of intermittently resetting
+                # client connections.
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                payload = self.rfile.read(length)
+                for attempt in range(TRANSIENT_ARCHIVE_RETRIES):
+                    status, body = forward_json_rpc(upstream_url, payload, opener)
+                    # Some archive providers intermittently return a missing-
+                    # trie error for old L2 state and serve the identical proof
+                    # on retry. Do not leak that provider flake into Anvil.
+                    if (
+                        b"missing trie node" not in body.lower()
+                        and b"historical state" not in body.lower()
+                    ):
+                        break
+                    if attempt + 1 < TRANSIENT_ARCHIVE_RETRIES:
+                        time.sleep(0.2 * (attempt + 1))
             except Exception:
                 self.send_error(502, "archive backend unavailable")
                 return
@@ -90,7 +113,7 @@ def relay_handler(upstream_url: str):
 
 
 def serve(upstream_url: str, host: str, port: int, port_file: str = "") -> None:
-    server = ThreadingHTTPServer((host, port), relay_handler(upstream_url))
+    server = ArchiveRelayServer((host, port), relay_handler(upstream_url))
     server.daemon_threads = True
     if port_file:
         Path(port_file).write_text(str(server.server_port), encoding="ascii")

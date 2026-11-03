@@ -55,6 +55,8 @@ if ! is_task "$task_id"; then
   exit 2
 fi
 
+python3 "$repo_root/scripts/check_starter_stubs.py" --task "$task_id"
+
 if [[ -f "$repo_root/.env" ]]; then
   source_env_file "$repo_root/.env"
 elif [[ -f "$repo_root/../env.sh" ]]; then
@@ -78,6 +80,7 @@ case "$chain" in
   blast) rpc_variable=BLAST_RPC_URL; alchemy_network=blast-mainnet ;;
   gnosis) rpc_variable=GNOSIS_RPC_URL; alchemy_network=gnosis-mainnet ;;
   mantle) rpc_variable=MANTLE_RPC_URL; alchemy_network=mantle-mainnet ;;
+  metis) rpc_variable=METIS_RPC_URL; alchemy_network=metis-mainnet ;;
   sei) rpc_variable=SEI_RPC_URL; alchemy_network=sei-mainnet ;;
   *) echo "unsupported task chain: $chain" >&2; exit 2 ;;
 esac

@@ -1,14 +1,33 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import AsyncMock, Mock
 
 from runner.pinned_environment import (
     AGENT_NETWORK,
     ANVIL_SERVICE,
     BACKEND_NETWORK,
     POLICY_SERVICE,
+    PinnedForkDockerEnvironment,
     add_policy_services,
 )
+
+
+class CleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_delete_does_not_remove_shared_task_image(self):
+        env = object.__new__(PinnedForkDockerEnvironment)
+        env._keep_containers = False
+        env.prepare_logs_for_host = AsyncMock()
+        env._run_docker_compose_command = AsyncMock()
+        env._cleanup_resources_compose_file = Mock()
+
+        await env.stop(delete=True)
+
+        env.prepare_logs_for_host.assert_awaited_once()
+        env._run_docker_compose_command.assert_awaited_once_with(
+            ["down", "--volumes", "--remove-orphans"]
+        )
+        env._cleanup_resources_compose_file.assert_called_once()
 
 
 class ComposePolicyTests(unittest.TestCase):
@@ -26,7 +45,10 @@ class ComposePolicyTests(unittest.TestCase):
         self.assertIn(BACKEND_NETWORK, services[ANVIL_SERVICE]["networks"])
         self.assertIn(AGENT_NETWORK, services[POLICY_SERVICE]["networks"])
         self.assertIn(BACKEND_NETWORK, services[POLICY_SERVICE]["networks"])
-        self.assertEqual(services["main"]["pids_limit"], 512)
+        self.assertEqual(
+            services["main"]["deploy"]["resources"]["limits"]["pids"], 512
+        )
+        self.assertNotIn("pids_limit", services["main"])
         self.assertEqual(services["main"]["cap_drop"], ["ALL"])
         self.assertEqual(
             services["main"]["cap_add"],
@@ -75,7 +97,8 @@ class ComposePolicyTests(unittest.TestCase):
             fork_block="1",
         )
         main = compose["services"]["main"]
-        self.assertEqual(main["pids_limit"], 512)
+        self.assertEqual(main["deploy"]["resources"]["limits"]["pids"], 512)
+        self.assertNotIn("pids_limit", main)
         self.assertEqual(main["cap_drop"], ["ALL"])
         self.assertEqual(
             main["cap_add"],

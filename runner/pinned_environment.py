@@ -35,7 +35,13 @@ def add_policy_services(
     networks[BACKEND_NETWORK] = {"internal": True}
 
     main = services.setdefault("main", {})
-    main["pids_limit"] = 512
+    # Pier also adds deploy.resource limits; Compose rejects a separate
+    # pids_limit when those two settings disagree. Keep the process cap in
+    # the same resource-limit block instead.
+    main.pop("pids_limit", None)
+    main.setdefault("deploy", {}).setdefault("resources", {}).setdefault("limits", {})[
+        "pids"
+    ] = 512
     main["cap_drop"] = ["ALL"]
     # The trusted root controller needs to read model-owned submissions and
     # atomically write Harbor bind mounts before dropping every capability for
@@ -130,6 +136,22 @@ def add_policy_services(
 
 class PinnedForkDockerEnvironment(DockerEnvironment):
     """Use policy sidecars for agent environments; leave verifiers unchanged."""
+
+    async def stop(self, delete: bool) -> None:
+        if not delete or self._keep_containers:
+            await super().stop(delete)
+            return
+
+        # Pier's --rmi all removes the shared task image used by other trials'
+        # sidecars. Keep images until the whole multi-trial job has finished.
+        await self.prepare_logs_for_host()
+        try:
+            await self._run_docker_compose_command(
+                ["down", "--volumes", "--remove-orphans"]
+            )
+        except Exception as exc:
+            self.logger.warning(f"Docker compose down failed: {exc}")
+        self._cleanup_resources_compose_file()
 
     def __init__(self, *args: Any, **kwargs: Any):
         self._agent_environment = (
