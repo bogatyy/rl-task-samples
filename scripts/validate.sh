@@ -49,6 +49,8 @@ for relative in (
     "docker/core/rl_agent/deepseek_model.py",
     "docker/core/rl_agent/openrouter_model.py",
     "docker/core/rl_agent/secure_environment.py",
+    "docker/core/rl_agent/tool_runner.py",
+    "docker/core/rl_agent/test_tool_runner.py",
     "docker/core/rl_agent/test_deepseek_model.py",
     "docker/core/rl_agent/test_openrouter_model.py",
     "docker/core/rl_agent/test_secure_environment.py",
@@ -105,6 +107,11 @@ echo "[validate] canonical host variables passed static validation"
   cd "$repo_root/docker/core"
   PYTHONPYCACHEPREFIX=/tmp/rl-policy-pycache python3 -m unittest -q test_policy_gateway.py
 )
+(
+  cd "$repo_root/docker/core"
+  PYTHONPYCACHEPREFIX=/tmp/rl-tool-runner-pycache python3 -m unittest -q rl_agent.test_tool_runner
+)
+grep -q 'run_tool_command' "$repo_root/docker/core/rl_agent/secure_environment.py"
 grep -q 'runner.pinned_environment:PinnedForkDockerEnvironment' "$repo_root/runner/run.sh"
 grep -q '"${RL_TASK_POLICY_ARCHIVE_RPC}"' "$repo_root/runner/pinned_environment.py"
 grep -q '"${RL_TASK_POLICY_ETHERSCAN_API_KEY}"' "$repo_root/runner/pinned_environment.py"

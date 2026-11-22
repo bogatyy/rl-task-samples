@@ -5,10 +5,13 @@ from __future__ import annotations
 import os
 import platform
 import shlex
+import subprocess
 from typing import Any
 
-from minisweagent.environments.local import LocalEnvironment, _run
+from minisweagent.environments.local import LocalEnvironment
 from minisweagent.utils.serialize import recursive_merge
+
+from rl_agent.tool_runner import run_tool_command
 
 
 _PROXY_KEYS = {
@@ -92,13 +95,30 @@ class SecureLocalEnvironment(LocalEnvironment):
         controller_environment = os.environ | self.config.env
         environment = sanitized_tool_env(controller_environment)
         command = unprivileged_tool_command(command, controller_environment)
+        limit = timeout or self.config.timeout
         try:
-            result = _run(command, cwd, environment, timeout or self.config.timeout)
-            output = {
-                "output": result.stdout,
-                "returncode": result.returncode,
-                "exception_info": "",
-            }
+            # Bounded capture: a command printing gigabytes must not take the
+            # controller down with it (see rl_agent/tool_runner.py).
+            result = run_tool_command(command, cwd, environment, limit)
+            if result.timed_out:
+                error = subprocess.TimeoutExpired(command, limit)
+                output = {
+                    "output": result.output,
+                    "returncode": -1,
+                    "exception_info": f"An error occurred while executing the command: {error}",
+                    "extra": {
+                        "exception_type": type(error).__name__,
+                        "exception": str(error),
+                    },
+                }
+            else:
+                output = {
+                    "output": result.output,
+                    "returncode": result.returncode,
+                    "exception_info": "",
+                }
+            if result.omitted_bytes:
+                output.setdefault("extra", {})["omitted_output_bytes"] = result.omitted_bytes
         except Exception as error:
             raw_output = getattr(error, "output", None)
             raw_output = (
