@@ -4,7 +4,7 @@ Eight public samples from an 847-task Harbor dataset of historical EVM opportuni
 
 ## Running
 
-Set `ALCHEMY_API_KEY` and `ETHERSCAN_API_KEY` in a local `.env` file; agent trials also need the selected model provider's key. Docker, Foundry, and Pier are required.
+Set `ALCHEMY_API_KEY` and `ETHERSCAN_API_KEY` in a local `.env` file; agent trials also need the selected model provider's key. Docker, Foundry, and Pier are required. `runner/run.sh` first starts a shared source cache ([`scripts/source_cache.sh`](scripts/source_cache.sh)), the only component that holds the Etherscan key; it paces explorer calls and stores verified source on the host in `$RL_SOURCE_CACHE_DIR` (default `~/Code/etherscan-cache`).
 
 ```sh
 ./scripts/validate.sh
@@ -16,7 +16,7 @@ Set `ALCHEMY_API_KEY` and `ETHERSCAN_API_KEY` in a local `.env` file; agent tria
 ## Design
 
 - Each task provides an audit target, a blank `/app/src/Exploit.sol`, a one-hour budget, and a separate verifier with a hidden grader.
-- The agent sees verified source and a local fork through restricted gateways. It cannot read post-fork canonical transactions or the archive credentials.
+- The agent sees verified source and a local fork through restricted gateways. It cannot read post-fork canonical transactions, the archive credentials, or the explorer key.
 - Reward is binary. The grader checks actual protected-system loss and proceeds received by `Exploit`, accounting for any supplied seed.
 - Bundled reference solutions and no-op controls support local validation; only `Exploit.sol` crosses into the verifier.
 

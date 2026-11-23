@@ -14,6 +14,11 @@ POLICY_SERVICE = "pier-policy"
 ANVIL_SERVICE = "pier-anvil"
 AGENT_NETWORK = "pier-egress-internal"
 BACKEND_NETWORK = "pier-chain-backend"
+# Shared, host-wide services (docker/source-cache, started by
+# scripts/source_cache.sh). Only the policy sidecar joins this network.
+SOURCE_NETWORK = "rl-shared"
+SOURCE_UPSTREAM_URL = "http://rl-source-cache:8080"
+POLICY_IMAGE = "rl-policy-gateway:v2"
 
 
 def add_policy_services(
@@ -21,8 +26,11 @@ def add_policy_services(
     *,
     image: str,
     archive_rpc: str,
-    etherscan_api_key: str,
     fork_block: str,
+    policy_image: str = POLICY_IMAGE,
+    source_upstream_url: str = SOURCE_UPSTREAM_URL,
+    source_upstream_token: str = "",
+    source_network: str = SOURCE_NETWORK,
     expected_block: str | None = None,
     target_timestamp: str | None = None,
     chain_id: str = "1",
@@ -33,6 +41,8 @@ def add_policy_services(
     networks = compose.setdefault("networks", {})
     networks.setdefault(AGENT_NETWORK, {"internal": True})
     networks[BACKEND_NETWORK] = {"internal": True}
+    if source_network:
+        networks[source_network] = {"external": True, "name": source_network}
 
     main = services.setdefault("main", {})
     # Pier also adds deploy.resource limits; Compose rejects a separate
@@ -102,8 +112,20 @@ def add_policy_services(
         "networks": [BACKEND_NETWORK, "default"],
     }
 
+    policy_environment = {
+        "EXPLORER_CHAIN_ID": chain_id,
+        "FORK_BLOCK_NUMBER": fork_block,
+        "RPC_BACKEND_URL": f"http://{ANVIL_SERVICE}:8545",
+        "SOURCE_UPSTREAM_URL": source_upstream_url,
+    }
+    if source_upstream_token:
+        policy_environment["SOURCE_UPSTREAM_TOKEN"] = source_upstream_token
+    policy_networks = [AGENT_NETWORK, BACKEND_NETWORK, "default"]
+    if source_network:
+        policy_networks.append(source_network)
+
     services[POLICY_SERVICE] = {
-        "image": image,
+        "image": policy_image,
         "user": "10001:10001",
         "cpus": 2.0,
         "mem_limit": "4096m",
@@ -111,12 +133,7 @@ def add_policy_services(
         "cap_drop": ["ALL"],
         "security_opt": ["no-new-privileges:true"],
         "entrypoint": ["python3", "/usr/local/lib/rl-task/policy_gateway.py"],
-        "environment": {
-            "ETHERSCAN_API_KEY": etherscan_api_key,
-            "EXPLORER_CHAIN_ID": chain_id,
-            "FORK_BLOCK_NUMBER": fork_block,
-            "RPC_BACKEND_URL": f"http://{ANVIL_SERVICE}:8545",
-        },
+        "environment": policy_environment,
         "depends_on": {ANVIL_SERVICE: {"condition": "service_healthy"}},
         "healthcheck": {
             "test": [
@@ -129,7 +146,7 @@ def add_policy_services(
             "timeout": "2s",
             "retries": 120,
         },
-        "networks": [AGENT_NETWORK, BACKEND_NETWORK, "default"],
+        "networks": policy_networks,
     }
     return compose
 
@@ -166,19 +183,27 @@ class PinnedForkDockerEnvironment(DockerEnvironment):
         archive_rpc = os.environ.get(
             "RL_TASK_ARCHIVE_RPC", os.environ.get("ETH_RPC_URL", "")
         )
-        etherscan_api_key = os.environ.get("ETHERSCAN_API_KEY", "")
         if not archive_rpc:
             raise ValueError("an archive RPC is required by the isolated Anvil service")
-        if not etherscan_api_key:
-            raise ValueError("ETHERSCAN_API_KEY is required by the source-only service")
         # Keep generated compose files secret-free. Docker Compose substitutes
         # these from Pier's host environment only when it starts the sidecars.
-        # Distinct names prevent the agent's deliberately dummy explorer key
-        # from shadowing the host key during Compose interpolation.
         os.environ["RL_TASK_POLICY_ARCHIVE_RPC"] = archive_rpc
-        os.environ["RL_TASK_POLICY_ETHERSCAN_API_KEY"] = etherscan_api_key
         self._archive_rpc = "${RL_TASK_POLICY_ARCHIVE_RPC}"
-        self._etherscan_api_key = "${RL_TASK_POLICY_ETHERSCAN_API_KEY}"
+
+        # Verified source comes from the shared source cache, which holds the
+        # explorer key; see scripts/source_cache.sh. Override the upstream for
+        # a remote cache (set RL_SOURCE_NETWORK= to skip the local network).
+        self._source_upstream_url = os.environ.get(
+            "RL_SOURCE_UPSTREAM_URL", SOURCE_UPSTREAM_URL
+        )
+        if not self._source_upstream_url.startswith(("http://", "https://")):
+            raise ValueError("RL_SOURCE_UPSTREAM_URL must be an http(s) URL")
+        self._source_network = os.environ.get("RL_SOURCE_NETWORK", SOURCE_NETWORK)
+        self._policy_image = os.environ.get("RL_POLICY_GATEWAY_IMAGE", POLICY_IMAGE)
+        self._source_upstream_token = ""
+        if os.environ.get("RL_SOURCE_UPSTREAM_TOKEN"):
+            os.environ["RL_TASK_POLICY_SOURCE_TOKEN"] = os.environ["RL_SOURCE_UPSTREAM_TOKEN"]
+            self._source_upstream_token = "${RL_TASK_POLICY_SOURCE_TOKEN}"
 
         self._task_image = self.task_env_config.docker_image or ""
         if not self._task_image:
@@ -237,8 +262,11 @@ class PinnedForkDockerEnvironment(DockerEnvironment):
             compose,
             image=self._task_image,
             archive_rpc=self._archive_rpc,
-            etherscan_api_key=self._etherscan_api_key,
             fork_block=self._fork_block,
+            policy_image=self._policy_image,
+            source_upstream_url=self._source_upstream_url,
+            source_upstream_token=self._source_upstream_token,
+            source_network=self._source_network,
             expected_block=self._expected_block,
             target_timestamp=self._target_timestamp,
             chain_id=self._chain_id,

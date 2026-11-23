@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Source-only Etherscan and fork-bounded JSON-RPC gateway.
+"""Source-only explorer and fork-bounded JSON-RPC gateway.
 
-This process runs in a sidecar that the agent cannot inspect. The agent can
-reach its two HTTP listeners, but not the archive-backed Anvil service behind
-it and not Etherscan directly.
+This process runs in a per-trial sidecar that the agent cannot inspect. The
+agent can reach its two HTTP listeners, but not the archive-backed Anvil
+service behind it and not the source upstream directly.
+
+Source lookups are validated here and forwarded to SOURCE_UPSTREAM_URL, the
+shared source cache (docker/source-cache), which owns the explorer credential,
+caching and upstream rate limiting. This sidecar keeps no source cache.
 """
 
 from __future__ import annotations
@@ -26,21 +30,17 @@ API_KEY_RE = re.compile(r"(?i)(apikey=)[^&\s\"'<>]+")
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_RPC_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_SOURCE_BYTES = 32 * 1024 * 1024
-MAX_SOURCE_CACHE_BYTES = 64 * 1024 * 1024
 MAX_BATCH_REQUESTS = 32
 MAX_RPC_CALLS = 25_000
-MAX_SOURCE_REQUESTS = 128
+# Distinct contract addresses one trial may look up. Repeats and retries of an
+# address already counted are free.
+MAX_SOURCE_REQUESTS = 1024
+# Longer than the source cache's own deadline, so its 503 reaches the agent.
+SOURCE_UPSTREAM_TIMEOUT_SECONDS = 60
 MAX_BLOCK_RANGE = 100_000
 MAX_FEE_HISTORY_BLOCKS = 8_192
 MAX_BACKEND_CONCURRENCY = 16
 MAX_SOURCE_CONCURRENCY = 4
-
-# Etherscan V2 does not cover every Alchemy-backed EVM chain. Keep the same
-# source-only query policy while routing those chains to a compatible verified
-# source endpoint. Unlike Etherscan, these public endpoints receive no API key.
-SOURCE_API_OVERRIDES = {
-    "1088": "https://andromeda-explorer.metis.io/api",
-}
 
 
 class PolicyError(Exception):
@@ -89,32 +89,24 @@ def validate_source_query(path: str, chain_id: str = "1") -> str:
     return address
 
 
-def source_api_request(chain_id: str, address: str, api_key: str) -> urllib.request.Request:
-    override = SOURCE_API_OVERRIDES.get(chain_id)
-    if override is not None:
-        query = urllib.parse.urlencode(
-            {
-                "module": "contract",
-                "action": "getsourcecode",
-                "address": address,
-            }
-        )
-        url = f"{override}?{query}"
-    else:
-        query = urllib.parse.urlencode(
-            {
-                "chainid": chain_id,
-                "module": "contract",
-                "action": "getsourcecode",
-                "address": address,
-                "apikey": api_key,
-            }
-        )
-        url = f"https://api.etherscan.io/v2/api?{query}"
+def source_upstream_request(
+    upstream_url: str, chain_id: str, address: str, token: str = ""
+) -> urllib.request.Request:
+    """Build the shared source cache request for one validated address."""
+    headers = {"User-Agent": "rl-task-source-gateway/2"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     return urllib.request.Request(
-        url,
-        headers={"User-Agent": "rl-task-source-gateway/1"},
+        f"{upstream_url.rstrip('/')}/v1/source/{chain_id}/{address.lower()}",
+        headers=headers,
     )
+
+
+def explorer_error_body(message: str) -> bytes:
+    return json.dumps(
+        {"status": "0", "message": "NOTOK", "result": message},
+        separators=(",", ":"),
+    ).encode()
 
 
 class Backend:
@@ -553,71 +545,58 @@ def rpc_handler(policy: RpcPolicy) -> type[QuietHandler]:
     return RpcHandler
 
 
-def source_handler(api_key: str, chain_id: str) -> type[QuietHandler]:
+def upstream_error_body(error: urllib.error.HTTPError) -> bytes:
+    """Pass the shared cache's explorer-shaped error through; mask anything else."""
+    with error:
+        body = error.read(MAX_SOURCE_BYTES + 1)
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict) and "status" in parsed and len(body) <= MAX_SOURCE_BYTES:
+        return body
+    return explorer_error_body(f"source gateway upstream returned HTTP {error.code}")
+
+
+def source_handler(
+    upstream_url: str, chain_id: str, token: str = ""
+) -> type[QuietHandler]:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    cache: dict[str, bytes] = {}
-    cache_lock = threading.Lock()
+    seen_lock = threading.Lock()
+    seen: set[str] = set()
     source_semaphore = threading.BoundedSemaphore(MAX_SOURCE_CONCURRENCY)
-    request_count = 0
-    cache_bytes = 0
 
     class SourceHandler(QuietHandler):
         def do_GET(self) -> None:  # noqa: N802
-            nonlocal cache_bytes, request_count
             if urllib.parse.urlsplit(self.path).path == "/health":
                 self.health()
                 return
             try:
-                address = validate_source_query(self.path, chain_id)
-                cache_key = address.lower()
-                with cache_lock:
-                    cached = cache.get(cache_key)
-                    if cached is None:
-                        request_count += 1
-                        if request_count > MAX_SOURCE_REQUESTS:
+                address = validate_source_query(self.path, chain_id).lower()
+                with seen_lock:
+                    if address not in seen:
+                        if len(seen) >= MAX_SOURCE_REQUESTS:
                             raise PolicyError("source request budget exhausted")
-                if cached is not None:
-                    self.send_body(200, cached, "application/json")
-                    return
-                request = source_api_request(chain_id, address, api_key)
+                        seen.add(address)
+                request = source_upstream_request(upstream_url, chain_id, address, token)
                 with source_semaphore:
-                    with opener.open(request, timeout=60) as response:
+                    with opener.open(
+                        request, timeout=SOURCE_UPSTREAM_TIMEOUT_SECONDS
+                    ) as response:
                         body = response.read(MAX_SOURCE_BYTES + 1)
                 if len(body) > MAX_SOURCE_BYTES:
                     raise PolicyError("source response too large")
-                if api_key:
-                    body = body.replace(api_key.encode(), b"<redacted>")
-                with cache_lock:
-                    if cache_bytes + len(body) <= MAX_SOURCE_CACHE_BYTES:
-                        cache[cache_key] = body
-                        cache_bytes += len(body)
                 self.send_body(200, body, "application/json")
             except PolicyError as error:
-                body = json.dumps(
-                    {"status": "0", "message": "NOTOK", "result": error.message},
-                    separators=(",", ":"),
-                ).encode()
-                self.send_body(403, body, "application/json")
+                self.send_body(403, explorer_error_body(error.message), "application/json")
             except urllib.error.HTTPError as error:
-                body = json.dumps(
-                    {
-                        "status": "0",
-                        "message": "NOTOK",
-                        "result": f"source gateway upstream returned HTTP {error.code}",
-                    },
-                    separators=(",", ":"),
-                ).encode()
-                self.send_body(error.code, body, "application/json")
+                self.send_body(error.code, upstream_error_body(error), "application/json")
             except (OSError, ValueError):
-                body = json.dumps(
-                    {
-                        "status": "0",
-                        "message": "NOTOK",
-                        "result": "source gateway unavailable",
-                    },
-                    separators=(",", ":"),
-                ).encode()
-                self.send_body(502, body, "application/json")
+                self.send_body(
+                    502,
+                    explorer_error_body("source gateway unavailable"),
+                    "application/json",
+                )
 
         def do_POST(self) -> None:  # noqa: N802
             self.send_body(405, b"method not allowed\n", "text/plain")
@@ -631,7 +610,10 @@ def source_handler(api_key: str, chain_id: str) -> type[QuietHandler]:
 def main() -> None:
     backend_url = os.environ.get("RPC_BACKEND_URL", "http://pier-anvil:8545")
     fork_block = int(os.environ["FORK_BLOCK_NUMBER"])
-    api_key = os.environ["ETHERSCAN_API_KEY"]
+    source_upstream_url = os.environ["SOURCE_UPSTREAM_URL"]
+    if not source_upstream_url.startswith(("http://", "https://")):
+        raise ValueError("SOURCE_UPSTREAM_URL must be an http(s) URL")
+    source_upstream_token = os.environ.get("SOURCE_UPSTREAM_TOKEN", "")
     explorer_chain_id = os.environ.get("EXPLORER_CHAIN_ID", "1")
     if not explorer_chain_id.isdigit():
         raise ValueError("EXPLORER_CHAIN_ID must be a decimal integer")
@@ -642,7 +624,10 @@ def main() -> None:
     servers = [
         ThreadingHTTPServer(("0.0.0.0", rpc_port), rpc_handler(policy)),
         ThreadingHTTPServer(
-            ("0.0.0.0", source_port), source_handler(api_key, explorer_chain_id)
+            ("0.0.0.0", source_port),
+            source_handler(
+                source_upstream_url, explorer_chain_id, source_upstream_token
+            ),
         ),
     ]
     threads = [threading.Thread(target=server.serve_forever) for server in servers]

@@ -63,8 +63,10 @@ elif [[ -f "$repo_root/../env.sh" ]]; then
   source_env_file "$repo_root/../env.sh"
 fi
 
-: "${ETHERSCAN_API_KEY:?set ETHERSCAN_API_KEY for verified-source access}"
-export ETHERSCAN_API_KEY
+# Verified source comes from the shared host-wide cache, which holds the
+# Etherscan key; trials never receive it. `up` is a no-op when it is running.
+"$repo_root/scripts/source_cache.sh" up
+unset ETHERSCAN_API_KEY
 
 task_path="$repo_root/tasks/$task_id"
 chain=$(awk -F'"' '/^chain = / { print $2; exit }' "$task_path/task.toml")

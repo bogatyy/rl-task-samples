@@ -2,6 +2,10 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# A negated command (`! grep ...`) never trips `set -e`, so negative checks
+# go through `refute`, which fails when the command succeeds.
+fail() { echo "[validate] $*" >&2; exit 1; }
+refute() { local reason=$1; shift; if "$@"; then fail "$reason"; fi; }
 [[ -f "$repo_root/AGENTS.md" ]]
 # This curated sample does not carry the full dataset's exclusion ledger.
 grep -q '^## Eligibility gate$' "$repo_root/AGENTS.md"
@@ -46,6 +50,8 @@ for relative in (
     "docker/core/collect_artifact.py",
     "docker/core/test_policy_gateway.py",
     "docker/core/test_archive_relay.py",
+    "docker/source-cache/source_cache.py",
+    "docker/source-cache/test_source_cache.py",
     "docker/core/rl_agent/deepseek_model.py",
     "docker/core/rl_agent/openrouter_model.py",
     "docker/core/rl_agent/secure_environment.py",
@@ -70,22 +76,29 @@ grep -q 'LITELLM_LOCAL_MODEL_COST_MAP=True' "$repo_root/docker/core/mini-swe-age
 grep -q '^ENV FOUNDRY_SOLC=/usr/local/bin/solc-0.8.28$' "$repo_root/docker/core/Dockerfile"
 grep -q 'version=2.4.6' "$repo_root/runner/run.sh"
 grep -q 'OPENROUTER_API_KEY' "$repo_root/runner/run.sh"
-! grep -q 'set -a' "$repo_root/runner/run.sh" "$repo_root/scripts/smoke_test.sh"
+refute "runner/run.sh and scripts/smoke_test.sh must not export whole env files" \
+  grep -q 'set -a' "$repo_root/runner/run.sh" "$repo_root/scripts/smoke_test.sh"
 grep -q 'set +x' "$repo_root/runner/run.sh"
 grep -q 'set +x' "$repo_root/scripts/smoke_test.sh"
-! grep -q 'tail .*anvil\.log\|tail .*rl-task-anvil\.log' \
+refute "Anvil logs must not be echoed into agent-visible output" \
+  grep -q 'tail .*anvil\.log\|tail .*rl-task-anvil\.log' \
   "$repo_root/docker/core/start-anvil.sh" "$repo_root/scripts/smoke_test.sh"
 grep -q 'archive_relay.py' "$repo_root/docker/core/start-anvil.sh"
 grep -q 'archive_relay.py' "$repo_root/scripts/smoke_test.sh"
-! grep -Fq 'anvil --fork-url "$archive_url"' \
+refute "Anvil must fork through the archive relay, not the archive URL" \
+  grep -Fq 'anvil --fork-url "$archive_url"' \
   "$repo_root/docker/core/start-anvil.sh" "$repo_root/scripts/smoke_test.sh"
 grep -q -- '--accounts 1' "$repo_root/docker/core/start-anvil.sh"
 grep -q -- '--accounts 1' "$repo_root/scripts/smoke_test.sh"
-! grep -R -q \
+refute "fork setup must not patch storage, impersonate, or replay transactions" \
+  grep -R -q \
   'anvil_setStorageAt\|anvil_impersonateAccount\|FORK_REPLAY_TRANSACTION_HASHES\|FORK_STORAGE_PATCHES' \
   "$repo_root/docker/core/start-anvil.sh" "$repo_root/scripts/smoke_test.sh" "$repo_root/tasks"
 [[ ! -e "$repo_root/docker/core/Grade.s.sol" ]]
-! grep -R -q 'Grade\.s\.sol' "$repo_root/docker" "$repo_root/runner" "$repo_root/scripts" "$repo_root/tasks"
+# validate.sh itself names the retired file in these checks.
+refute "the retired Grade.s.sol grader is still referenced" \
+  grep -R -q --exclude=validate.sh 'Grade\.s\.sol' \
+  "$repo_root/docker" "$repo_root/runner" "$repo_root/scripts" "$repo_root/tasks"
 grep -q "forge create src/ExploitGrader.sol:ExploitGrader" "$repo_root/docker/core/verifier.sh"
 grep -q "cast send \"\$grader\" 'grade()'" "$repo_root/docker/core/verifier.sh"
 echo "[validate] model and verifier layers passed static validation"
@@ -112,9 +125,35 @@ echo "[validate] canonical host variables passed static validation"
   PYTHONPYCACHEPREFIX=/tmp/rl-tool-runner-pycache python3 -m unittest -q rl_agent.test_tool_runner
 )
 grep -q 'run_tool_command' "$repo_root/docker/core/rl_agent/secure_environment.py"
+(
+  cd "$repo_root/docker/source-cache"
+  PYTHONPYCACHEPREFIX=/tmp/rl-source-cache-pycache python3 -m unittest -q test_source_cache.py
+)
 grep -q 'runner.pinned_environment:PinnedForkDockerEnvironment' "$repo_root/runner/run.sh"
 grep -q '"${RL_TASK_POLICY_ARCHIVE_RPC}"' "$repo_root/runner/pinned_environment.py"
-grep -q '"${RL_TASK_POLICY_ETHERSCAN_API_KEY}"' "$repo_root/runner/pinned_environment.py"
+grep -q 'SOURCE_UPSTREAM_URL' "$repo_root/runner/pinned_environment.py"
+if grep -qE 'RL_TASK_POLICY_ETHERSCAN|environ.*ETHERSCAN' "$repo_root/runner/pinned_environment.py"; then
+  fail "runner/pinned_environment.py must not read the explorer key"
+fi
+if grep -q 'policy_gateway.py' "$repo_root/docker/core/Dockerfile"; then
+  fail "docker/core/Dockerfile must not ship the policy gateway"
+fi
+# Verified source has one path: the shared cache. Only scripts/source_cache.sh
+# may require or export the explorer key, and every launcher that runs pier
+# must start the cache first.
+while IFS= read -r launcher; do
+  case "$launcher" in
+    "$repo_root/scripts/source_cache.sh"|"$repo_root/scripts/validate.sh") continue ;;
+  esac
+  if grep -qE 'ETHERSCAN_API_KEY:\?|^[[:space:]]*export [^#]*ETHERSCAN_API_KEY' "$launcher"; then
+    fail "${launcher#$repo_root/} requires or exports the explorer key; only scripts/source_cache.sh holds it"
+  fi
+  if grep -q 'pier run' "$launcher" && ! grep -q 'scripts/source_cache.sh" up' "$launcher"; then
+    fail "${launcher#$repo_root/} runs pier without starting the shared source cache"
+  fi
+done < <(find "$repo_root/runner" "$repo_root/scripts" -name '*.sh' -type f)
+echo "[validate] every launcher reads verified source through the shared cache"
+grep -q 'COPY policy_gateway.py' "$repo_root/docker/core/policy-gateway.Dockerfile"
 if pier_bin=$(command -v pier 2>/dev/null); then
   pier_python=$(head -n 1 "$pier_bin")
   pier_python=${pier_python#\#!}
@@ -164,7 +203,8 @@ for task_id in "${tasks[@]}"; do
   grep -Eq 'bool[[:space:]]+public[[:space:]]+passed[[:space:]]*;' "$task_dir/tests/ExploitGrader.sol"
   grep -Eq 'function[[:space:]]+grade\(\)[[:space:]]*external' "$task_dir/tests/ExploitGrader.sol"
   grep -Eq '[[:alnum:]_]+[[:space:]]*\.[[:space:]]*execute\(\)[[:space:]]*;' "$task_dir/tests/ExploitGrader.sol"
-  ! grep -q 'function submission\|event Graded\|private grading' "$task_dir/tests/ExploitGrader.sol"
+  refute "$task_id: grader keeps retired submission/event/private-grading code" \
+    grep -q 'function submission\|event Graded\|private grading' "$task_dir/tests/ExploitGrader.sol"
   grep -q '^FROM rl-exploits-foundry-core:latest$' "$task_dir/environment/Dockerfile"
   grep -q '^COPY --chown=rltool:rltool project/ /app/$' "$task_dir/environment/Dockerfile"
   grep -q 'forge build --offline' "$task_dir/environment/Dockerfile"
@@ -177,8 +217,10 @@ for task_id in "${tasks[@]}"; do
   [[ ! -e "$task_dir/environment/project/reference" ]]
   [[ ! -e "$task_dir/tests/Grade.s.sol" ]]
   (( $(wc -c < "$task_dir/solution/Exploit.sol") <= 131072 ))
-  ! cmp -s "$task_dir/solution/Exploit.sol" "$task_dir/environment/project/src/Exploit.sol"
-  ! grep -Eq \
+  refute "$task_id: reference solution is identical to the starter" \
+    cmp -s "$task_dir/solution/Exploit.sol" "$task_dir/environment/project/src/Exploit.sol"
+  refute "$task_id: reference solution uses cheatcodes, Anvil mutation, or raw transactions" \
+    grep -Eq \
     '\bvm\.|\bhevm\b|anvil_(set|impersonate)|eth_sendRawTransaction|eth_getRawTransaction' \
     "$task_dir/solution/Exploit.sol"
 

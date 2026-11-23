@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import json
+import threading
 import unittest
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 from policy_gateway import (
     PolicyError,
     RpcPolicy,
     safe_backend_error,
-    source_api_request,
+    source_handler,
+    source_upstream_request,
     validate_source_query,
 )
 
@@ -129,19 +136,124 @@ class SourcePolicyTests(unittest.TestCase):
                 "8453",
             )
 
-    def test_metis_source_request_uses_public_explorer_without_secret(self):
-        address = "0x" + "12" * 20
-        request = source_api_request("1088", address, "secret-key")
-        self.assertTrue(request.full_url.startswith("https://andromeda-explorer.metis.io/api?"))
-        self.assertIn(f"address={address}", request.full_url)
-        self.assertNotIn("secret-key", request.full_url)
+    def test_upstream_request_targets_shared_cache(self):
+        address = "0x" + "AB" * 20
+        request = source_upstream_request("http://rl-source-cache:8080/", "8453", address, "tok")
+        self.assertEqual(
+            request.full_url, f"http://rl-source-cache:8080/v1/source/8453/{address.lower()}"
+        )
+        self.assertEqual(request.get_header("Authorization"), "Bearer tok")
+        self.assertIsNone(
+            source_upstream_request("http://cache", "1", address).get_header("Authorization")
+        )
 
-    def test_etherscan_source_request_keeps_v2_chain_and_key(self):
-        address = "0x" + "12" * 20
-        request = source_api_request("8453", address, "secret-key")
-        self.assertTrue(request.full_url.startswith("https://api.etherscan.io/v2/api?"))
-        self.assertIn("chainid=8453", request.full_url)
-        self.assertIn("apikey=secret-key", request.full_url)
+
+VERIFIED_BODY = json.dumps(
+    {"status": "1", "message": "OK", "result": [{"SourceCode": "contract A {}", "ContractName": "A"}]}
+).encode()
+BUSY_BODY = json.dumps(
+    {"status": "0", "message": "NOTOK", "result": "source cache upstream busy; retry"}
+).encode()
+BUSY_ADDRESS = "0x" + "bb" * 20
+BROKEN_ADDRESS = "0x" + "ee" * 20
+
+
+class FakeSourceCache(BaseHTTPRequestHandler):
+    seen: list[tuple[str, str | None]] = []
+
+    def log_message(self, *_args):
+        return
+
+    def do_GET(self):
+        FakeSourceCache.seen.append((self.path, self.headers.get("Authorization")))
+        if self.path.endswith(BUSY_ADDRESS):
+            status, body, kind = 503, BUSY_BODY, "application/json"
+        elif self.path.endswith(BROKEN_ADDRESS):
+            status, body, kind = 500, b"<html>boom</html>", "text/html"
+        else:
+            status, body, kind = 200, VERIFIED_BODY, "application/json"
+        self.send_response(status)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class SourceForwardingTests(unittest.TestCase):
+    def setUp(self):
+        FakeSourceCache.seen = []
+        self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeSourceCache)
+        upstream_url = f"http://127.0.0.1:{self.upstream.server_address[1]}"
+        self.gateway = ThreadingHTTPServer(
+            ("127.0.0.1", 0), source_handler(upstream_url, "1", "cache-token")
+        )
+        self.servers = [self.upstream, self.gateway]
+        for server in self.servers:
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        for server in self.servers:
+            server.shutdown()
+            server.server_close()
+
+    def get(self, address, server=None):
+        server = server or self.gateway
+        url = (
+            f"http://127.0.0.1:{server.server_address[1]}/api?chainid=1&module=contract"
+            f"&action=getsourcecode&address={address}&apikey=source-only"
+        )
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, error.read()
+
+    def test_lookup_is_forwarded_with_token(self):
+        address = "0x" + "Ab" * 20
+        status, body = self.get(address)
+        self.assertEqual((status, body), (200, VERIFIED_BODY))
+        self.assertEqual(
+            FakeSourceCache.seen, [(f"/v1/source/1/{address.lower()}", "Bearer cache-token")]
+        )
+
+    def test_explorer_shaped_errors_pass_through(self):
+        status, body = self.get(BUSY_ADDRESS)
+        self.assertEqual((status, body), (503, BUSY_BODY))
+
+    def test_other_upstream_errors_are_masked(self):
+        status, body = self.get(BROKEN_ADDRESS)
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body)["result"], "source gateway upstream returned HTTP 500")
+
+    def test_rejected_queries_never_reach_upstream(self):
+        url = f"http://127.0.0.1:{self.gateway.server_address[1]}/api?module=account&action=txlist"
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(url, timeout=5)
+        caught.exception.close()
+        self.assertEqual(caught.exception.code, 403)
+        self.assertEqual(FakeSourceCache.seen, [])
+
+    def test_budget_counts_distinct_addresses_only(self):
+        first, second, third = ("0x" + c * 40 for c in "123")
+        with mock.patch("policy_gateway.MAX_SOURCE_REQUESTS", 2):
+            self.assertEqual(self.get(first)[0], 200)
+            self.assertEqual(self.get(second)[0], 200)
+            self.assertEqual(self.get(first)[0], 200)
+            status, body = self.get(third)
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body)["result"], "source request budget exhausted")
+
+    def test_unreachable_upstream_is_502(self):
+        dead = ThreadingHTTPServer(("127.0.0.1", 0), FakeSourceCache)
+        dead_url = f"http://127.0.0.1:{dead.server_address[1]}"
+        dead.server_close()
+        gateway = ThreadingHTTPServer(("127.0.0.1", 0), source_handler(dead_url, "1"))
+        threading.Thread(target=gateway.serve_forever, daemon=True).start()
+        self.servers.append(gateway)
+        status, body = self.get("0x" + "12" * 20, server=gateway)
+        self.assertEqual(status, 502)
+        self.assertEqual(json.loads(body)["result"], "source gateway unavailable")
 
 
 class RpcPolicyTests(unittest.TestCase):
